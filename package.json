@@ -1,13 +1,16 @@
 {
   "name": "dsh-xin505-notify",
   "version": "0.1.0-alpha.1",
-  "private": true,
   "description": "Desktop popups for DeepSeek Harness: a Windows notification when a reply finishes, when an approval is pending, when a question waits for you, or when the account runs out of quota.",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/xin505/dsh-xin505-notify.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "alpha"
   },
   "engines": {
     "node": ">=22",
