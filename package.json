@@ -1,7 +1,7 @@
 {
   "name": "dsh-xin505-notify",
   "version": "0.1.0-alpha.1",
-  "description": "Desktop popups for DeepSeek Harness: a Windows notification when a reply finishes, when an approval is pending, when a question waits for you, or when the account runs out of quota.",
+  "description": "DeepSeek Harness 的 Windows 桌面通知。你不可能一直盯着 Agent。它卡在权限审批、额度不足或其他问题上，你可能一时没发现。这时候，你就需要这个插件了。",
   "type": "module",
   "license": "MIT",
   "repository": {
