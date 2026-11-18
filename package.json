@@ -1,0 +1,50 @@
+{
+  "name": "dsh-xin505-notify",
+  "version": "0.1.0-alpha.1",
+  "private": true,
+  "description": "Desktop popups for DeepSeek Harness: a Windows notification when a reply finishes, when an approval is pending, when a question waits for you, or when the account runs out of quota.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xin505/dsh-xin505-notify.git"
+  },
+  "engines": {
+    "node": ">=22",
+    "dsh": "0.2.2-rc.3"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "toast.ps1",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-session",
+        "@deepseek-ai/dsh-client-ui-settings-general"
+      ]
+    }
+  }
+}
