@@ -1,198 +1,137 @@
-/**
- * Browser half of the desktop-notify bundle.
- *
- * It consumes bounded Host turn-end metadata and asks the Host for a toast.
- *
- * - Turn-end outcomes distinguish successful work, failures and user stops.
- * - `uiSession.sessionStatus` exposes pending approvals and questions after
- *   the built-in UI has accepted them, without relying on waterfall ordering.
- *
- * Account and quota failures are announced by the Host half instead, because
- * the failure codes never reach the page.
- *
- * One preference row in Settings > General switches the feature off and sends
- * a test notification on demand.
- */
+/** Client integration for DeepSeek Harness Windows notifications. */
 window.__ModuleLoader__.load({
   id: 'dsh-xin505-notify',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
-
-    /** Client locale namespace owned by this plugin. */
     const NS = 'desktopNotify';
-    /** The Host route that raises the actual Windows toast. */
-    const TOAST_ENDPOINT = '/api/dsh-xin505-notify/toast';
-    const SETTINGS_ENDPOINT = '/api/dsh-xin505-notify/settings';
-    const EVENTS_ENDPOINT = '/api/dsh-xin505-notify/events';
-    /** Longest detail a toast shows before it gets truncated. */
+    const BASE = '/api/dsh-xin505-notify/';
     const BODY_LIMIT = 180;
+    const encoder = new TextEncoder();
 
     const DICTS = {
       zh: {
         'row.title': '桌面通知',
-        'row.description': '回复完成、需要你确认或需要你回答时弹出系统弹窗；也包含额度和登录失效的提醒。',
-        'row.test': '发送测试弹窗',
-        'row.sent': '已发出测试弹窗。没看到的话，检查 Windows 通知设置里 DeepSeek Harness 是否被关掉了。',
-        'row.failed': '弹窗没发出去，请查看 DSH 日志里的 toast.log。',
-        'row.notReady': '宿主通知通道还没就绪，重启一次 DeepSeek Harness 再试。',
-        'row.systemOff': 'Windows 把这个应用的通知关掉了：设置 › 系统 › 通知 里打开 DeepSeek Harness。',
-        'row.disabled': '桌面通知已关闭，先打开右侧开关。',
-        'switch.label': '桌面通知',
-        'notify.doneTitle': '回复完成',
-        'notify.doneBody': '请回到 DeepSeek Harness 查看结果。',
-        'notify.failedTitle': '执行出错',
-        'notify.failedBody': '这一轮没有正常完成。',
-        'notify.quotaTitle': '额度或余额不足',
-        'notify.authTitle': '需要登录或检查凭证',
-        'notify.configTitle': '请检查模型配置',
-        'notify.rateTitle': '请求受到限流',
-        'notify.approvalTitle': '需要你的确认',
-        'notify.approvalBody': '有一个操作在等你授权。',
-        'notify.questionTitle': '需要你回答',
-        'notify.questionBody': '代理有一个问题在等你回答。',
-        'notify.testTitle': '回复完成',
-        'notify.testBody': '通知已开启，这是回复完成时的提醒。',
-        'notify.readyTitle': '桌面通知已就绪',
-        'notify.readyBody': '以后回复完成、需要你授权、额度用完时会像这样弹出来。',
+        'row.description': '回复完成、出错或需要你处理时显示 Windows 通知。',
+        'row.preview': '显示内容预览',
+        'row.previewDescription': '在通知中显示回复、会话标题或待办详情。内容可能出现在锁屏和共享屏幕上。',
+        'row.test': '发送测试通知',
+        'row.sent': '测试通知已发送。',
+        'row.failed': '发送失败，请查看插件的 toast.log。',
+        'row.notReady': '暂时无法连接通知服务，请稍后重试。',
+        'row.systemOff': '请在 Windows 设置 › 系统 › 通知中允许 DeepSeek Harness 发送通知。',
+        'row.disabled': '请先打开桌面通知。',
       },
       en: {
         'row.title': 'Desktop notifications',
-        'row.description': 'Pops up a Windows notification when a reply finishes, an approval is pending, a question waits for you, or the account needs attention.',
-        'row.test': 'Send a test popup',
-        'row.sent': 'Test popup sent. If you did not see it, check that DeepSeek Harness is allowed in Windows notification settings.',
-        'row.failed': 'The popup could not be sent. Check toast.log in the DSH log directory.',
-        'row.notReady': 'The host notification channel is not ready yet — restart DeepSeek Harness and try again.',
-        'row.systemOff': 'Windows notifications are off for this app. Turn on DeepSeek Harness under Settings > System > Notifications.',
-        'row.disabled': 'Desktop notifications are off. Turn on the switch first.',
-        'switch.label': 'Desktop notifications',
-        'notify.doneTitle': 'Reply finished',
-        'notify.doneBody': 'Return to DeepSeek Harness to see the result.',
-        'notify.failedTitle': 'Turn failed',
-        'notify.failedBody': 'This turn did not finish.',
-        'notify.quotaTitle': 'Quota or balance exhausted',
-        'notify.authTitle': 'Sign in or check credentials',
-        'notify.configTitle': 'Check model configuration',
-        'notify.rateTitle': 'Request rate limited',
-        'notify.approvalTitle': 'Approval needed',
-        'notify.approvalBody': 'An operation is waiting for your decision.',
-        'notify.questionTitle': 'Answer needed',
-        'notify.questionBody': 'The agent is waiting for your answer.',
-        'notify.testTitle': 'Reply finished',
-        'notify.testBody': 'Notifications are on. This is what a finished reply looks like.',
-        'notify.readyTitle': 'Desktop notifications are ready',
-        'notify.readyBody': 'Finished replies, pending approvals and exhausted quota will pop up like this.',
+        'row.description': 'Show Windows notifications when a reply finishes, a task fails, or your attention is needed.',
+        'row.preview': 'Show content previews',
+        'row.previewDescription': 'Include reply text, session titles and pending request details. They may appear on your lock screen or a shared screen.',
+        'row.test': 'Send test notification',
+        'row.sent': 'Test notification sent.',
+        'row.failed': 'Delivery failed. See the plugin’s toast.log.',
+        'row.notReady': 'The notification service is unavailable. Try again shortly.',
+        'row.systemOff': 'Allow DeepSeek Harness in Windows Settings › System › Notifications.',
+        'row.disabled': 'Turn on desktop notifications first.',
       },
     };
 
-    // ---- the one stored preference -------------------------------------
-
-    // The Host owns the preference for all windows and Host-generated events.
-    // Stay quiet until it has supplied the persisted setting.
-    let enabled = false;
-    let settingsReady = false;
-    let settingsLoading = false;
-    const listeners = new Set();
-
-    function setEnabled(next) {
-      enabled = next !== false;
-      for (const listener of [...listeners]) {
-        try {
-          listener(enabled);
-        } catch {
-          // A broken row must not break the notifier.
-        }
-      }
-    }
-
-    async function settingsRequest(value) {
-      if (value === undefined && settingsLoading) return false;
-      if (value === undefined) settingsLoading = true;
+    async function api(path, data) {
       const transport = window.__DSH_TRANSPORT__?.fetch;
+      const url = BASE + path;
       const send = transport ?? ((...args) => window.fetch(...args));
-      const endpoint = value === undefined ? SETTINGS_ENDPOINT : SETTINGS_ENDPOINT + '/update';
-      const url = transport ? endpoint.slice(1) : endpoint;
-      const options = value === undefined ? { credentials: 'same-origin' } : {
-        method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ enabled: value }),
-      };
+      const init = { credentials: 'same-origin' };
+      if (data !== undefined) Object.assign(init, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(data),
+      });
+      let timeout;
+      const controller = new AbortController();
+      const expired = new Promise(resolve => {
+        timeout = window.setTimeout(() => { controller.abort(); resolve({ ok: false, exit: 'timeout' }); }, 15_000);
+      });
+      // Desktop carriers may serialize options across IPC. Only native browser fetch takes the AbortSignal.
+      if (!transport) init.signal = controller.signal;
       try {
-        const response = await send(url, options);
-        if (!response.ok) return false;
-        const result = await response.json();
-        if (result?.ok !== true || typeof result.enabled !== 'boolean') return false;
-        settingsReady = true;
-        setEnabled(result.enabled);
-        return true;
+        const read = async () => {
+          const response = await send(transport ? url.slice(1) : url, init);
+          if (!response.ok) return { ok: false, exit: 'http-' + response.status };
+          return await response.json();
+        };
+        return await Promise.race([read(), expired]);
       } catch {
-        return false;
+        return { ok: false, exit: 'network' };
       } finally {
-        if (value === undefined) settingsLoading = false;
+        window.clearTimeout(timeout);
       }
     }
 
-    function subscribeEnabled(listener) {
-      listeners.add(listener);
-      return () => {
-        listeners.delete(listener);
-      };
+    let settings = { enabled: false, preview: false };
+    let ready = false;
+    let revision = 0;
+    let reading;
+    let writing;
+    const listeners = new Set();
+    const subscribe = fn => { listeners.add(fn); return () => listeners.delete(fn); };
+    const readState = () => settings;
+
+    async function receiveSettings(patch, version) {
+      const value = await api(patch ? 'settings/update' : 'settings', patch);
+      if (version !== revision || value?.ok !== true || typeof value.enabled !== 'boolean') return false;
+      const changed = !ready || settings.enabled !== value.enabled || settings.preview !== (value.preview === true);
+      ready = true;
+      if (changed) {
+        settings = { enabled: value.enabled, preview: value.preview === true };
+        for (const fn of listeners) fn();
+      }
+      return true;
     }
 
-    // ---- asking the Host for a toast -----------------------------------
+    function refreshSettings() {
+      if (writing) return writing;
+      if (reading) return reading;
+      const promise = receiveSettings(undefined, revision).finally(() => { if (reading === promise) reading = undefined; });
+      reading = promise;
+      return promise;
+    }
 
-    /** True while the page is visible and focused, i.e. the user is already looking. */
+    function updateSettings(patch) {
+      const version = ++revision;
+      reading = undefined;
+      const save = () => receiveSettings(patch, version);
+      const promise = (writing ? writing.then(save, save) : save()).finally(() => { if (writing === promise) writing = undefined; });
+      writing = promise;
+      return promise;
+    }
+
     function attentionOnPage() {
-      try {
-        if (document.visibilityState !== 'visible') return false;
-        return typeof document.hasFocus !== 'function' || document.hasFocus();
-      } catch {
-        return false;
-      }
-    }
-
-    /**
-     * Ask the Host to raise one Windows toast.
-     * @returns `ok`, or the reason / PowerShell exit code when it did not work,
-     *          so the settings row can say what went wrong.
-     */
-    async function sendToast(title, body, silent) {
-      if (!enabled) return { ok: false, reason: 'disabled' };
-      // The desktop shell may carry the authenticated fetch itself; the plain
-      // page fetch falls back to the loopback origin's session cookie.
-      const transport = window.__DSH_TRANSPORT__?.fetch;
-      const send = transport ?? ((...args) => window.fetch(...args));
-      try {
-        const response = await send(transport ? TOAST_ENDPOINT.slice(1) : TOAST_ENDPOINT, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ title, body, silent: silent === true }),
-          credentials: 'same-origin',
-        });
-        if (!response.ok) {
-          // No route yet (Host half not loaded), or the peer lost access.
-          const missing = response.status === 401 || response.status === 403 || response.status === 404;
-          return { ok: false, reason: missing ? 'not-ready' : 'http-' + String(response.status) };
-        }
-        let payload = null;
-        try {
-          payload = await response.json();
-        } catch {
-          payload = null;
-        }
-        if (payload?.ok === true) return { ok: true };
-        return { ok: false, exit: payload?.exit, reason: 'invalid-response' };
-      } catch {
-        return { ok: false, reason: 'network' };
-      }
+      return document.visibilityState === 'visible' && (typeof document.hasFocus !== 'function' || document.hasFocus());
     }
 
     function clipped(value) {
-      const text = typeof value === 'string' ? value.trim() : '';
-      if (text === '') return '';
-      return [...text].slice(0, BODY_LIMIT).join('');
+      if (typeof value !== 'string') return '';
+      let result = '', count = 0;
+      for (const char of value.trimStart()) {
+        if (count++ >= BODY_LIMIT) break;
+        result += char;
+      }
+      return result.trimEnd();
     }
 
-    // ---- the settings row ----------------------------------------------
+    async function notify(payload, getDetail, relevant = () => true) {
+      if (!settings.enabled || !relevant()) return { ok: false, exit: 'cancelled' };
+      // Re-read the Host setting before touching private text. Another window may have disabled previews.
+      if (getDetail && settings.preview && await refreshSettings() && settings.preview && settings.enabled && relevant()) {
+        const body = clipped(getDetail());
+        if (body) payload.body = body;
+      }
+      if (!settings.enabled || !relevant()) return { ok: false, exit: 'cancelled' };
+      if (encoder.encode(JSON.stringify(payload)).length > 4096) delete payload.body;
+      return await api('toast', payload);
+    }
+
+    function localeOf(t) {
+      return t('row.title') === DICTS.zh['row.title'] ? 'zh' : 'en';
+    }
 
     const ROW_CSS = `
 .dsn-row{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:16px 0;border-bottom:0.5px solid var(--dsw-alias-border-l2);}
@@ -212,341 +151,266 @@ window.__ModuleLoader__.load({
 `;
 
     function NotifyRow(props) {
-      const translate = typeof props.t === 'function' ? props.t : (key) => key;
-      const [on, setOn] = React.useState(enabled);
+      const t = typeof props.t === 'function' ? props.t : key => key;
+      const prefs = React.useSyncExternalStore(subscribe, readState);
       const [notice, setNotice] = React.useState(null);
       const [busy, setBusy] = React.useState(false);
-
-      React.useEffect(() => subscribeEnabled(setOn), []);
-
-      /** Explain a failed toast attempt in the row itself. */
-      const explain = (result) => {
-        if (result.ok) {
-          setNotice(translate('row.sent'));
-          return;
-        }
-        if (result.reason === 'disabled') setNotice(translate('row.disabled'));
-        else if (result.reason === 'not-ready' || result.reason === 'network') setNotice(translate('row.notReady'));
-        else if (result.exit === 2) setNotice(translate('row.systemOff'));
-        else setNotice(translate('row.failed'));
+      const explain = result => {
+        if (result.ok) return 'row.sent';
+        if (result.exit === 2) return 'row.systemOff';
+        if (result.exit === 'disabled' || result.exit === 'cancelled') return 'row.disabled';
+        return ['network', 'timeout', 'http-401', 'http-403', 'http-404'].includes(result.exit) ? 'row.notReady' : 'row.failed';
       };
-
-      const sendTest = async () => {
-        if (!enabled) {
-          setNotice(translate('row.disabled'));
-          return;
-        }
+      const test = async () => {
         setBusy(true);
-        try {
-          explain(await sendToast('DeepSeek Harness · ' + translate('notify.testTitle'), translate('notify.testBody'), false));
-        } finally {
-          setBusy(false);
-        }
+        try { setNotice(t(explain(await notify({ type: 'test', locale: localeOf(t), silent: false })))); }
+        finally { setBusy(false); }
       };
-
-      const onToggle = async () => {
-        const next = !on;
+      const toggle = async name => {
         setBusy(true);
         setNotice(null);
-        if (!await settingsRequest(next)) {
-          setNotice(translate('row.notReady'));
-          setBusy(false);
-          return;
-        }
-        setBusy(false);
-        if (!next) return;
-        setBusy(true);
-        void sendToast('DeepSeek Harness · ' + translate('notify.testTitle'), translate('notify.testBody'), false)
-          .then(explain)
-          .finally(() => setBusy(false));
+        try {
+          const next = !prefs[name];
+          if (!await updateSettings({ [name]: next })) setNotice(t('row.notReady'));
+          else if (name === 'enabled' && next) setNotice(t(explain(await notify({ type: 'test', locale: localeOf(t), silent: false }))));
+        } finally { setBusy(false); }
       };
-
-      return h('div', { className: 'dsn-row' },
-        h('style', null, ROW_CSS),
+      const sw = (name, label) => h('button', {
+        type: 'button', role: 'switch', 'aria-label': t(label), 'aria-checked': prefs[name],
+        className: 'dsn-switch', disabled: busy || (name === 'preview' && !prefs.enabled),
+        onClick: () => toggle(name),
+      }, h('span', { className: 'dsn-thumb' }));
+      const row = (name, title, description, testButton) => h('div', { className: 'dsn-row' },
         h('div', { className: 'dsn-text' },
-          h('div', { className: 'dsn-title' }, translate('row.title')),
-          h('div', { className: 'dsn-desc' }, translate('row.description')),
-          notice === null ? null : h('div', { className: 'dsn-notice', role: 'status' }, notice),
+          h('div', { className: 'dsn-title' }, t(title)),
+          h('div', { className: 'dsn-desc' }, t(description)),
+          testButton && notice ? h('div', { className: 'dsn-notice', role: 'status' }, notice) : null,
         ),
         h('div', { className: 'dsn-actions' },
-          h('button', {
-            type: 'button',
-            className: 'dsn-test',
-            disabled: busy,
-            onClick: () => { void sendTest(); },
-          }, translate('row.test')),
-          h('button', {
-            type: 'button',
-            role: 'switch',
-            'aria-checked': on,
-            'aria-label': translate('switch.label'),
-            className: 'dsn-switch',
-            disabled: busy,
-            onClick: onToggle,
-          }, h('span', { className: 'dsn-thumb' })),
+          testButton ? h('button', { type: 'button', className: 'dsn-test', disabled: busy || !prefs.enabled, onClick: test }, t('row.test')) : null,
+          sw(name, title),
         ),
+      );
+      return h('div', null, h('style', null, ROW_CSS),
+        row('enabled', 'row.title', 'row.description', true),
+        row('preview', 'row.preview', 'row.previewDescription', false),
       );
     }
 
-    // ---- the notifier --------------------------------------------------
-
-    const inject = ['slots', 'locale', 'remote', 'uiSession'];
-
-    function apply(ctx) {
-      ctx.effect(() => ctx.locale.register(NS, DICTS), 'dsh-xin505-notify: dictionaries');
-      ctx.effect(() => {
-        const refresh = () => { void settingsRequest(); };
-        refresh();
-        window.addEventListener('focus', refresh);
-        return () => window.removeEventListener('focus', refresh);
-      }, 'dsh-xin505-notify: settings');
-
-      /** The interface language decides both the row and the toast copy. */
-      const t = ctx.locale.bind(NS);
-      const chineseUi = () => {
-        try {
-          return t('row.title') === DICTS.zh['row.title'];
-        } catch {
-          return false;
-        }
-      };
-
-      ctx.slots.inject('settings.general.item', () => ctx.slots.register({
-        name: 'settings.general.item',
-        id: 'desktop-notify',
-        order: 23,
-        locale: NS,
-      }, NotifyRow));
-
-      // One-time self-test: the first page load that reaches the Host toast
-      // route says so with a real popup, and only then is the flag stored, so a
-      // page loaded before the Host half exists simply tries again later.
-      const VERIFIED_KEY = 'dsh-xin505-notify:verified';
-      let verified = false;
+    function previewOf(ctx, sessionId, turn) {
       try {
-        verified = window.localStorage.getItem(VERIFIED_KEY) === '1';
-      } catch {
-        // An unreadable flag only repeats the self-test.
-      }
-      if (!verified) {
-        const attempt = (delays) => {
-          if (delays.length === 0) return;
-          window.setTimeout(() => {
-            void sendToast('DeepSeek Harness · ' + t('notify.readyTitle'), t('notify.readyBody'), false).then((result) => {
-              if (result.ok) {
-                try {
-                  window.localStorage.setItem(VERIFIED_KEY, '1');
-                } catch {
-                  // Retrying the self-test on the next load is harmless.
-                }
-                return;
-              }
-              attempt(delays.slice(1));
-            });
-          }, delays[0]);
-        };
-        // A page loaded before the Host half exists retries instead of giving up.
-        attempt([1500, 5000, 15000]);
-      }
-
-      /** Durable display title of one Session, when the Client catalog already knows it. */
-      const titleOf = (sessionId) => {
-        try {
-          const sessions = ctx.get('sessions');
-          const row = sessions?.list?.getSnapshot?.()?.byId?.[sessionId];
-          if (row === undefined) return undefined;
-          if (typeof row.title === 'string' && row.title !== '') return row.title;
-          if (typeof row.displayTitle === 'string' && row.displayTitle !== sessionId) return row.displayTitle;
-        } catch {
-          // A missing catalog only costs the title in the toast.
-        }
-        return undefined;
-      };
-
-      // Only use an already-retained, permission-scoped client history. Never
-      // open another session or ask the Host bridge for message contents.
-      const previewOf = (sessionId, turn) => {
-        try {
-          const entries = ctx.get('sessions')?.binding?.(sessionId)?.eventSource?.getSnapshot?.()?.entries;
-          if (!Array.isArray(entries)) return '';
+        // Only borrow a history the Client already retained.
+        const sessions = ctx.get('sessions');
+        const entries = sessions?.binding?.(sessionId)?.eventSource?.getSnapshot?.()?.entries;
+        if (Array.isArray(entries)) {
           for (let i = entries.length - 1; i >= 0; i--) {
             const event = entries[i]?.event;
             if (event?.type !== 'assistant/message' || event.data?.turn !== turn || event.data.interrupted) continue;
-            const content = event.data.message?.content;
-            if (!Array.isArray(content)) return '';
-            const text = content.filter(block => block?.type === 'text' && typeof block.text === 'string').map(block => block.text).join(' ');
-            return clipped(text);
+            const blocks = event.data.message?.content;
+            let text = '';
+            if (Array.isArray(blocks)) {
+              for (const block of blocks) {
+                if (block?.type !== 'text') continue;
+                const piece = clipped(block.text);
+                if (piece) text += (text ? ' ' : '') + piece;
+                if (text.length >= BODY_LIMIT * 2) break;
+              }
+            }
+            if (text) return clipped(text);
+            break;
           }
-        } catch { /* No permission-scoped loaded history; use a generic body. */ }
-        return '';
-      };
-
-      /** The human-readable approval reason for the interface language. */
-      const reasonOf = (request) => {
-        const display = request?.displayReason;
-        if (display !== null && typeof display === 'object') {
-          const preferred = chineseUi() ? 'zh' : 'en';
-          if (typeof display[preferred] === 'string' && display[preferred] !== '') return display[preferred];
-          if (typeof display.en === 'string' && display.en !== '') return display.en;
         }
-        const reason = clipped(request?.reason);
-        return reason === '' ? undefined : reason;
-      };
-
-      ctx.effect(() => {
-        const disposers = [];
-        let cursor;
-        let epoch;
-        let polling = false;
-        let disposed = false;
-        let queue = Promise.resolve();
-        const delays = new Map();
-        const delay = (ms) => new Promise(resolve => {
-          const timer = window.setTimeout(() => { delays.delete(timer); resolve(); }, ms);
-          delays.set(timer, resolve);
-        });
-        const queueToast = (title, body, silent, stillRelevant = () => true) => {
-          const send = async () => {
-            for (let attempt = 0; attempt < 3; attempt++) {
-              if (disposed || !enabled || !stillRelevant()) return { ok: false, reason: 'cancelled' };
-              const result = await sendToast(title, body, silent);
-              if (result.ok) return result;
-              const retryable = ['rate-limited', 'busy'].includes(result.exit) || ['http-429', 'http-503'].includes(result.reason);
-              if (!retryable || attempt === 2) return result;
-              // The Host permits ten toasts per ten-second window.
-              await delay(10_500);
-            }
-            return { ok: false };
-          };
-          const result = queue.then(send, send);
-          queue = result.catch(() => {});
-          return result;
-        };
-        const pollTurns = async () => {
-          if (polling || disposed) return;
-          // Keep the initial event cursor while the preference is unknown so
-          // a slow settings response does not discard newly completed turns.
-          if (cursor !== undefined && !settingsReady) {
-            void settingsRequest();
-            return;
-          }
-          polling = true;
-          try {
-            const transport = window.__DSH_TRANSPORT__?.fetch;
-            const send = transport ?? ((...args) => window.fetch(...args));
-            const base = transport ? EVENTS_ENDPOINT.slice(1) : EVENTS_ENDPOINT;
-            const read = async after => {
-              const endpoint = base + (after === undefined ? '' : '?after=' + encodeURIComponent(after));
-              const response = await send(endpoint, { credentials: 'same-origin' });
-              if (!response.ok) return null;
-              const value = await response.json();
-              return value?.ok === true && typeof value.epoch === 'string' && Number.isSafeInteger(value.cursor) && Array.isArray(value.events) ? value : null;
-            };
-            let result = await read(cursor);
-            if (disposed || !result) return;
-            if (epoch !== undefined && result.epoch !== epoch) {
-              const newEpoch = result.epoch;
-              result = await read(0);
-              if (disposed || !result || result.epoch !== newEpoch) return;
-            }
-            // The first read establishes a baseline; previously settled turns
-            // must not be repeated when the page starts or reconnects.
-            const initial = cursor === undefined;
-            cursor = result.cursor;
-            epoch = result.epoch;
-            if (initial) return;
-            for (const event of result.events) {
-              if (!enabled || event?.hostAnnounced || typeof event?.sessionId !== 'string') continue;
-              if (event.kind === 'completed') {
-                const body = previewOf(event.sessionId, event.turn) || clipped(titleOf(event.sessionId)) || t('notify.doneBody');
-                await queueToast('DeepSeek Harness · ' + t('notify.doneTitle'), body, attentionOnPage());
-              } else if (['error', 'blocked', 'max-tokens'].includes(event.kind)) {
-                const code = String(event.code ?? '').toUpperCase();
-                const key = ['QUOTA', 'ACCOUNT_QUOTA'].includes(code) ? 'notify.quotaTitle'
-                  : ['AUTH', 'MISSING_CREDENTIAL', 'INVALID_CREDENTIAL', 'ACCOUNT_SIGN_IN_REQUIRED', 'ACCOUNT_TOKEN_INVALID'].includes(code) ? 'notify.authTitle'
-                    : code === 'NO_ADAPTER' ? 'notify.configTitle' : code === 'RATE_LIMIT' ? 'notify.rateTitle' : 'notify.failedTitle';
-                await queueToast('DeepSeek Harness · ' + t(key), t('notify.failedBody'), attentionOnPage());
-              }
-            }
-          } catch { /* Host temporarily unavailable; retry on the next tick. */ }
-          finally { polling = false; }
-        };
-        void pollTurns();
-        const pollTimer = window.setInterval(pollTurns, 1500);
-        disposers.push(() => {
-          disposed = true;
-          window.clearInterval(pollTimer);
-          for (const [timer, resolve] of delays) { window.clearTimeout(timer); resolve(); }
-          delays.clear();
-        });
-
-        // The built-in answerers may stop the request waterfall before a later
-        // listener sees it. Observe their published pending state instead.
-        const seenPending = new Set();
-        const pendingInFlight = new Set();
-        const pendingExhausted = new Set();
-        const remember = (set, id) => {
-          set.add(id);
-          if (set.size > 1024) set.delete(set.values().next().value);
-        };
-        const scanPending = () => {
-          if (!enabled) return;
-          try {
-            for (const [sessionId, status] of ctx.uiSession.sessionStatus.getSnapshot()) {
-              const request = status?.pendingInteraction;
-              if (!request || typeof request.key !== 'string') continue;
-              if (!['approval', 'question', 'plan-review'].includes(request.kind)) continue;
-              const id = JSON.stringify([sessionId, request.key]);
-              if (seenPending.has(id) || pendingInFlight.has(id) || pendingExhausted.has(id)) continue;
-              pendingInFlight.add(id);
-              const relevant = () => {
-                const current = ctx.uiSession.sessionStatus.getSnapshot().get(sessionId)?.pendingInteraction;
-                return current?.key === request.key && current.kind === request.kind;
-              };
-              let title;
-              let body;
-              if (request.kind === 'approval') {
-                title = t('notify.approvalTitle');
-                body = reasonOf(request) ?? t('notify.approvalBody');
-              } else {
-                const first = Array.isArray(request.questions) ? request.questions[0] : undefined;
-                const asked = clipped(first?.question);
-                title = t('notify.questionTitle');
-                body = asked === '' ? t('notify.questionBody')
-                  : (typeof first?.header === 'string' && first.header.trim() !== '' ? first.header.trim() + '：' + asked : asked);
-              }
-              void queueToast('DeepSeek Harness · ' + title, body, attentionOnPage(), relevant).then(result => {
-                pendingInFlight.delete(id);
-                if (result.ok) remember(seenPending, id);
-                else if (result.reason !== 'cancelled') remember(pendingExhausted, id);
-                else if (!disposed && enabled && relevant()) scanPending();
-              });
-            }
-          } catch (error) {
-            console.warn('[dsh-xin505-notify] cannot read pending interactions:', error);
-          }
-        };
-        disposers.push(ctx.uiSession.sessionStatus.subscribe(scanPending));
-        let previouslyEnabled = enabled;
-        disposers.push(subscribeEnabled(value => {
-          if (value && !previouslyEnabled) pendingExhausted.clear();
-          previouslyEnabled = value;
-          scanPending();
-        }));
-        scanPending();
-
-        return () => {
-          for (const dispose of disposers) {
-            try {
-              dispose();
-            } catch {
-              // Disposal must not keep other registrations alive.
-            }
-          }
-        };
-      }, 'dsh-xin505-notify: forwarded events');
+        const row = sessions?.list?.getSnapshot?.()?.byId?.[sessionId];
+        return clipped(row?.title) || (row?.displayTitle !== sessionId ? clipped(row?.displayTitle) : '');
+      } catch { return ''; }
     }
 
+    function actionable(request) {
+      if (!request || typeof request.key !== 'string' || !['approval', 'question', 'plan-review'].includes(request.kind)) return false;
+      if (request.kind === 'approval') return request.answerable !== false;
+      if (request.review !== undefined) return false;
+      const card = request.getSnapshot?.();
+      return !card?.closed && card?.state !== 'continued' && card?.waitState !== 'continued';
+    }
+
+    function pendingDetail(request, locale) {
+      if (request.kind === 'approval') {
+        return clipped(request.displayReason?.[locale]) || clipped(request.displayReason?.en) || clipped(request.reason);
+      }
+      const item = request.questions?.[0];
+      const question = clipped(item?.question);
+      const header = clipped(item?.header);
+      return header && question ? clipped(header + '：' + question) : question;
+    }
+
+    // Most cards have a Host tool call ID. Unnamed legacy cards have only a renderer-local number.
+    const pageId = window.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2);
+    function identity(sessionId, request) {
+      if (typeof request.callId === 'string' && request.callId) return JSON.stringify([sessionId, request.kind, 'call', request.callId]);
+      return JSON.stringify([sessionId, request.kind, pageId, request.key]);
+    }
+
+    function wireKey(id) {
+      const bytes = encoder.encode(id);
+      if (bytes.length <= 384) return id;
+      // Routing only. Use the same bounded identity even on pages without SubtleCrypto.
+      let fnv = 2166136261;
+      let djb = 5381;
+      for (const byte of bytes) {
+        fnv = Math.imul(fnv ^ byte, 16777619);
+        djb = Math.imul(djb, 33) ^ byte;
+      }
+      return 'id:' + bytes.length + ':' + (fnv >>> 0).toString(16) + ':' + (djb >>> 0).toString(16);
+    }
+
+    const inject = ['slots', 'locale', 'remote', 'uiSession'];
+    function apply(ctx) {
+      ctx.effect(() => ctx.locale.register(NS, DICTS), 'dsh-xin505-notify: dictionaries');
+      const t = ctx.locale.bind(NS);
+      const locale = () => localeOf(t);
+      ctx.slots.inject('settings.general.item', () => ctx.slots.register({
+        name: 'settings.general.item', id: 'desktop-notify', order: 23, locale: NS,
+      }, NotifyRow));
+
+      ctx.effect(() => {
+        let disposed = false, polling = false, cursor, epoch, pollCount = 0;
+        let readyTimer;
+        let disconnected = false;
+        const pending = new Map();
+        const sent = new Set();
+        const retryMs = [1500, 5000, 10500, 30000, 60000];
+        const status = ctx.uiSession.sessionStatus;
+        const isCurrent = (sessionId, id) => {
+          const request = status.getSnapshot().get(sessionId)?.pendingInteraction;
+          return !disposed && settings.enabled && actionable(request) && JSON.stringify([sessionId, request.key]) === id;
+        };
+        const clear = item => { window.clearTimeout(item.timer); pending.delete(item.id); };
+        const sendPending = async item => {
+          const valid = () => pending.get(item.id) === item && isCurrent(item.sessionId, item.id);
+          if (!valid()) return;
+          item.timer = undefined;
+          try {
+            const request = status.getSnapshot().get(item.sessionId)?.pendingInteraction;
+            const key = wireKey(identity(item.sessionId, request));
+            const ref = [item.sessionId, request.callId ?? null];
+            if (!valid()) return;
+            const getRequest = () => status.getSnapshot().get(item.sessionId)?.pendingInteraction;
+            const language = locale();
+            const result = await notify({
+              type: 'pending', kind: getRequest().kind, key, locale: language, silent: attentionOnPage(),
+              ...(encoder.encode(JSON.stringify(ref)).length <= 1024 ? { ref } : {}),
+            }, () => pendingDetail(getRequest(), language), valid);
+            if (!valid()) return;
+            if (result.ok || result.exit === 'stale') {
+              sent.add(item.id);
+              if (sent.size > 1024) sent.delete(sent.values().next().value);
+              clear(item);
+              return;
+            }
+            // Permanent rejection can be reconsidered after settings, focus or connectivity changes.
+            if (result.exit === 2 || result.exit === 'disabled' || ['http-400','http-413'].includes(result.exit)) {
+              item.paused = true;
+              return;
+            }
+          } catch { /* Keep the still-pending action eligible after a carrier failure. */ }
+          if (valid()) {
+            if (item.attempt >= retryMs.length) { item.paused = true; return; }
+            const ms = retryMs[item.attempt++];
+            item.timer = window.setTimeout(() => { void sendPending(item); }, ms);
+          }
+        };
+        function scanPending() {
+          for (const item of pending.values()) if (!isCurrent(item.sessionId, item.id)) clear(item);
+          if (disposed || !settings.enabled) return;
+          for (const [sessionId, state] of status.getSnapshot()) {
+            const request = state?.pendingInteraction;
+            if (!actionable(request)) continue;
+            const id = JSON.stringify([sessionId, request.key]);
+            if (pending.has(id) || sent.has(id)) continue;
+            const item = { id, sessionId, attempt: 0, timer: undefined, paused: false };
+            pending.set(id, item);
+            void sendPending(item);
+          }
+        }
+        const resume = () => {
+          if (disposed) return;
+          for (const item of pending.values()) {
+            if (item.timer !== undefined || item.paused) clear(item);
+          }
+          scanPending();
+        };
+        const reconnect = () => { void refreshSettings().then(ok => { if (ok) resume(); }); };
+
+        async function pollTurns() {
+          if (polling || disposed) return;
+          if (++pollCount % 10 === 0) void refreshSettings();
+          if (cursor !== undefined && !ready) { void refreshSettings(); return; }
+          polling = true;
+          try {
+            const read = after => api(after === undefined ? 'events' : 'events?after=' + encodeURIComponent(after));
+            let batch = await read(cursor);
+            if (disposed) return;
+            if (!batch?.ok) { disconnected = true; return; }
+            if (epoch !== undefined && batch.epoch !== epoch) {
+              const receivedEpoch = batch.epoch;
+              batch = await read(0);
+              if (!batch?.ok || batch.epoch !== receivedEpoch || disposed) return;
+            }
+            if (typeof batch.epoch !== 'string' || !Number.isSafeInteger(batch.cursor) || !Array.isArray(batch.events)) return;
+            if (disconnected) {
+              disconnected = false;
+              reconnect();
+            }
+            const initial = cursor === undefined;
+            cursor = batch.cursor;
+            epoch = batch.epoch;
+            if (initial || !settings.enabled) return;
+            // The Host owns the terminal notification even if every optional hint is lost.
+            for (const event of batch.events) {
+              if (disposed || !settings.enabled) break;
+              if (!Number.isSafeInteger(event?.id) || typeof event.sessionId !== 'string') continue;
+              const detail = event.kind === 'completed' ? () => previewOf(ctx, event.sessionId, event.turn) : undefined;
+              await notify({ type: 'turn', epoch, id: event.id, locale: locale(), silent: attentionOnPage() }, detail, () => !disposed);
+            }
+          } finally { polling = false; }
+        }
+
+        const VERIFIED_KEY = 'dsh-xin505-notify:verified';
+        async function readyTest(attempt) {
+          if (disposed) return;
+          const result = await notify({ type: 'ready', locale: locale(), silent: false }, undefined, () => !disposed);
+          if (disposed) return;
+          if (result.ok) {
+            try { window.localStorage.setItem(VERIFIED_KEY, '1'); } catch {}
+          } else if (attempt < 2) {
+            readyTimer = window.setTimeout(() => { void readyTest(attempt + 1); }, attempt === 0 ? 5000 : 15000);
+          }
+        }
+        let verified;
+        try { verified = window.localStorage.getItem(VERIFIED_KEY); } catch {}
+        if (verified !== '1') readyTimer = window.setTimeout(() => { void readyTest(0); }, 1500);
+
+        const offState = status.subscribe(scanPending);
+        const offSettings = subscribe(scanPending);
+        window.addEventListener('online', reconnect);
+        window.addEventListener('focus', reconnect);
+        void refreshSettings();
+        scanPending();
+        void pollTurns();
+        const pollTimer = window.setInterval(pollTurns, 1500);
+        return () => {
+          disposed = true;
+          offState(); offSettings();
+          window.removeEventListener('online', reconnect); window.removeEventListener('focus', reconnect);
+          window.clearInterval(pollTimer); window.clearTimeout(readyTimer);
+          for (const item of pending.values()) clear(item);
+          revision++;
+          reading = undefined;
+          ready = false;
+          settings = { enabled: false, preview: false };
+        };
+      }, 'dsh-xin505-notify: page events');
+    }
     return { inject, apply };
   },
 });

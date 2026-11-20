@@ -1,79 +1,75 @@
-/**
- * Host half of the desktop-notify bundle.
- *
- * Two jobs:
- *
- * 1. It owns the actual Windows popup. `POST /api/dsh-xin505-notify/toast`
- *    runs Windows PowerShell 5.1 — which carries the WinRT projections — with
- *    `toast.ps1` and the application's own AppUserModelId, so the notification
- *    appears as "DeepSeek Harness". The browser half decides *when* to notify,
- *    because only the page knows whether the window is in front, and calls
- *    this route.
- *
- * 2. Account and quota failures are announced here, because the Host — not the
- *    page — sees the provider-neutral failure codes (`QUOTA`, `ACCOUNT_QUOTA`,
- *    `AUTH`, `RATE_LIMIT`).
- *
- * Every attempt is appended to `$DSH_HOME/dsh-xin505-notify/toast.log` so a
- * missing popup can be diagnosed without a debugger.
- */
-import { spawn } from 'node:child_process';
-import { appendFileSync, mkdirSync, statSync, writeFileSync, readFileSync, renameSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { createDelivery } from './delivery.js';
+import * as native from './native.js';
 
-/** Required Host service: the connection owns the authenticated page-facing route. */
 export const inject = ['connection'];
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const TOAST_SCRIPT = join(HERE, 'toast.ps1');
-/** The desktop shell's own AppUserModelId, registered by its Start Menu shortcut. */
-const APP_ID = 'com.deepseek.dsh';
-const POWERSHELL = join(
-  process.env.SystemRoot ?? 'C:\\Windows',
-  'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe',
-);
-const MAX_TITLE = 120;
-const MAX_BODY = 400;
-const MAX_LOG_BYTES = 256 * 1024;
-const SPAWN_TIMEOUT_MS = 10_000;
-
-const HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh');
-const LOG_DIR = join(HOME, 'dsh-xin505-notify');
-const LOG_FILE = join(LOG_DIR, 'toast.log');
-const SETTINGS_FILE = join(LOG_DIR, 'settings.json');
+const BASE = '/api/dsh-xin505-notify/';
 const MAX_REQUEST_BYTES = 4096;
-const MAX_CONCURRENT = 2;
-const RATE_LIMIT_COUNT = 10;
-const RATE_LIMIT_MS = 10_000;
-let active = 0;
-let recentToasts = [];
+const TURN_GRACE_MS = 2200;
+const PENDING_KINDS = new Set(['approval', 'question', 'plan-review']);
+const END_KINDS = new Set(['completed', 'error', 'blocked', 'max-tokens', 'aborted']);
+const CANCEL_CAUSES = new Set(['user', 'hook', 'parent', 'disposed']);
+const COPY = {
+  completed: ['回复完成', '请回到 DeepSeek Harness 查看结果。', 'Reply finished', 'Return to DeepSeek Harness to see the result.'],
+  failed: ['执行出错', '这一轮没有正常完成。', 'Turn failed', 'This turn did not finish.'],
+  interrupted: ['任务已中断', '请回到 DeepSeek Harness 查看中断的任务。', 'Task interrupted', 'Return to DeepSeek Harness to check the interrupted task.'],
+  quota: ['额度或余额不足', '模型服务报告可用额度不足，请检查余额或配额。', 'Quota or balance exhausted', 'The model service reported insufficient quota or balance.'],
+  auth: ['需要登录或检查凭证', '请检查模型服务的登录状态或凭证。', 'Sign-in or credentials need attention', 'Check the model service sign-in or credentials.'],
+  config: ['请检查模型配置', '未找到可用的模型服务。', 'Check model configuration', 'No model service is available.'],
+  rate: ['请求受到限流', '请查看会话中的重试状态。', 'Rate limited', 'Check the retry status in the session.'],
+  expired: ['登录已过期', '请重新登录 DeepSeek Harness 账号。', 'Session expired', 'Sign in to DeepSeek Harness again.'],
+  approval: ['需要你的确认', '有一个操作在等你授权。', 'Approval needed', 'An operation is waiting for your decision.'],
+  question: ['需要你回答', '代理有一个问题在等你回答。', 'Answer needed', 'The agent is waiting for your answer.'],
+  'plan-review': ['需要审阅计划', '有一份计划在等你审阅。', 'Plan review needed', 'A plan is waiting for your review.'],
+  ready: ['桌面通知已就绪', '桌面通知已经开启。', 'Desktop notifications are ready', 'Desktop notifications are on.'],
+  test: ['测试通知', '桌面通知通道正常。', 'Test notification', 'Desktop notifications are working.'],
+};
 
-function readEnabled() {
-  let raw;
-  try { raw = readFileSync(SETTINGS_FILE, 'utf8'); }
-  catch (error) { if (error?.code === 'ENOENT') return true; throw error; }
-  const value = JSON.parse(raw);
-  if (!value || typeof value.enabled !== 'boolean') throw new Error('invalid settings');
-  return value.enabled;
+function defaultLocale() {
+  const locale = process.env.LC_ALL || process.env.LANG || Intl.DateTimeFormat().resolvedOptions().locale;
+  return /^zh/i.test(locale) ? 'zh' : 'en';
 }
-function saveEnabled(enabled) {
-  mkdirSync(LOG_DIR, { recursive: true });
-  const temp = join(LOG_DIR, `settings-${randomUUID()}.tmp`);
-  try {
-    writeFileSync(temp, JSON.stringify({ enabled }) + '\n', { encoding: 'utf8', flag: 'wx' });
-    renameSync(temp, SETTINGS_FILE);
-  } finally { try { unlinkSync(temp); } catch {} }
+
+function makeMessage(kind, locale, silent = false, detail = '') {
+  const offset = locale === 'zh' ? 0 : 2;
+  const text = COPY[kind];
+  const fallbackBody = text[offset + 1];
+  return {
+    title: 'DeepSeek Harness · ' + text[offset], body: detail || fallbackBody, fallbackBody,
+    silent, source: 'host:' + kind,
+  };
 }
+
+function failureKind(code) {
+  switch (code) {
+    case 'QUOTA': case 'ACCOUNT_QUOTA': return 'quota';
+    case 'AUTH': case 'MISSING_CREDENTIAL': case 'INVALID_CREDENTIAL':
+    case 'ACCOUNT_SIGN_IN_REQUIRED': case 'ACCOUNT_TOKEN_INVALID': return 'auth';
+    case 'NO_ADAPTER': return 'config';
+    case 'RATE_LIMIT': return 'rate';
+    default: return undefined;
+  }
+}
+
+function terminalKind(event) {
+  if (event.kind === 'aborted') return ['parent', 'hook', 'disposed'].includes(event.cause) ? 'interrupted' : undefined;
+  if (event.kind === 'completed') return 'completed';
+  return failureKind(event.code) ?? 'failed';
+}
+
+const isRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const mainSession = session => typeof session?.id === 'string' && session.header?.origin !== 'subagent' && !(session.header?.delegationDepth > 0);
+const turnKey = (sessionId, turn, kind) => JSON.stringify(['turn', sessionId, turn, kind]);
+const json = (data, status = 200) => Response.json(data, { status, headers: { 'cache-control': 'no-store' } });
+const invalid = () => json({ ok: false, exit: 'invalid-request' }, 400);
+
 async function readBody(request) {
-  if (!request.headers.get('content-type')?.toLowerCase().startsWith('application/json')) return { status: 400 };
-  const length = Number(request.headers.get('content-length'));
-  if (Number.isFinite(length) && length > MAX_REQUEST_BYTES) return { status: 413 };
-  if (!request.body) return { status: 400 };
+  if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json' || !request.body) return { status: 400 };
+  if (Number(request.headers.get('content-length')) > MAX_REQUEST_BYTES) return { status: 413 };
   const reader = request.body.getReader();
-  const chunks = []; let size = 0;
+  const chunks = [];
+  let size = 0;
   try {
     while (true) {
       const { value, done } = await reader.read();
@@ -82,294 +78,167 @@ async function readBody(request) {
       if (size > MAX_REQUEST_BYTES) return { status: 413 };
       chunks.push(value);
     }
-    try { return { value: JSON.parse(Buffer.concat(chunks).toString('utf8')) }; }
-    catch { return { status: 400 }; }
-  } finally { try { await reader.cancel(); } catch {} reader.releaseLock(); }
+    return { value: JSON.parse(Buffer.concat(chunks).toString('utf8')) };
+  } catch { return { status: 400 }; }
+  finally { try { await reader.cancel(); } catch {} reader.releaseLock(); }
 }
 
+export function apply(ctx) { registerNotifications(ctx, native); }
 
-const TITLES = {
-  quota: { zh: '额度不足 / 余额用完', en: 'Quota or balance exhausted' },
-  auth: { zh: '需要检查登录或凭证', en: 'Sign-in or credentials need attention' },
-  config: { zh: '需要配置模型', en: 'Model configuration required' },
-  rate: { zh: '请求被限流了', en: 'Rate limited' },
-  expired: { zh: '登录已过期', en: 'Session expired' },
-};
-
-function chineseHost() {
-  try {
-    const raw = process.env.LC_ALL ?? process.env.LANG ?? Intl.DateTimeFormat().resolvedOptions().locale ?? '';
-    return String(raw).toLowerCase().includes('zh');
-  } catch {
-    return true;
-  }
-}
-
-/** Localized copy for a Host-initiated toast. */
-function titleOf(kind) {
-  const entry = TITLES[kind];
-  if (entry === undefined) return 'DeepSeek Harness';
-  return 'DeepSeek Harness · ' + (chineseHost() ? entry.zh : entry.en);
-}
-
-function appendLog(line) {
-  try {
-    mkdirSync(LOG_DIR, { recursive: true });
-    try {
-      if (statSync(LOG_FILE).size > MAX_LOG_BYTES) writeFileSync(LOG_FILE, '');
-    } catch {
-      // No log file yet.
-    }
-    appendFileSync(LOG_FILE, new Date().toISOString() + ' ' + line + '\n', 'utf8');
-  } catch {
-    // Diagnostics must never break the notifier.
-  }
-}
-
-/** One-line, length-bounded, control-free text safe to hand to PowerShell. */
-function clean(value, limit) {
-  if (typeof value !== 'string') return '';
-  const flat = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
-  return [...flat].slice(0, limit).join('');
-}
-
-/**
- * Raise one Windows popup.
- * @returns `{ ok, exit }`; `exit` is the PowerShell exit code or a transport word.
- */
-function showToast(input) {
-  try { if (!readEnabled()) return Promise.resolve({ ok: false, exit: 'disabled' }); }
-  catch { return Promise.resolve({ ok: false, exit: 'settings-error' }); }
-  const now = Date.now();
-  recentToasts = recentToasts.filter(at => now - at < RATE_LIMIT_MS);
-  if (active >= MAX_CONCURRENT || recentToasts.length >= RATE_LIMIT_COUNT) return Promise.resolve({ ok: false, exit: 'rate-limited' });
-  recentToasts.push(now);
-  active++;
-  const title = clean(input.title, MAX_TITLE) || 'DeepSeek Harness';
-  const body = clean(input.body, MAX_BODY);
-  const source = typeof input.source === 'string' ? input.source : 'unknown';
-  const args = [
-    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
-    '-File', TOAST_SCRIPT,
-    '-Title', title,
-    '-Body', body === '' ? ' ' : body,
-    '-AppId', APP_ID,
-  ];
-  if (input.silent === true) args.push('-Silent');
-
-  return new Promise((resolve) => {
-    let settled = false;
-    let stdoutText = '';
-    let stderrText = '';
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      active--;
-      appendLog(`exit=${String(result.exit)} source=${source} silent=${input.silent === true}`);
-      resolve(result);
-    };
-
-    let child;
-    try {
-      child = spawn(POWERSHELL, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    } catch (error) {
-      finish({ ok: false, exit: 'spawn-threw' });
-      return;
-    }
-
-    const timer = setTimeout(() => {
-      try {
-        child.kill();
-      } catch {
-        // The process may already be gone.
-      }
-      finish({ ok: false, exit: 'timeout' });
-    }, SPAWN_TIMEOUT_MS);
-
-    child.stdout?.on('data', (chunk) => {
-      if (stdoutText.length < 2000) stdoutText += String(chunk);
-    });
-    child.stderr?.on('data', (chunk) => {
-      if (stderrText.length < 2000) stderrText += String(chunk);
-    });
-    child.on('error', (error) => {
-      clearTimeout(timer);
-      finish({ ok: false, exit: 'spawn-error' });
-    });
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      const exit = typeof code === 'number' ? code : String(code);
-      if (typeof exit === 'string') {
-        stdoutText = stdoutText.trim();
-        stderrText = stderrText.trim();
-      } else {
-        stdoutText = stdoutText.trim().slice(0, 300);
-        stderrText = stderrText.trim().slice(0, 300);
-      }
-      finish({ ok: exit === 0, exit });
-    });
-  });
-}
-
-/** Provider-neutral failure code -> notification kind, or undefined to stay quiet. */
-function failureKind(code) {
-  switch (String(code ?? '').toUpperCase()) {
-    case 'QUOTA':
-    case 'ACCOUNT_QUOTA':
-      return 'quota';
-    case 'AUTH':
-    case 'MISSING_CREDENTIAL':
-    case 'INVALID_CREDENTIAL':
-    case 'ACCOUNT_SIGN_IN_REQUIRED':
-    case 'ACCOUNT_TOKEN_INVALID':
-      return 'auth';
-    case 'NO_ADAPTER':
-      return 'config';
-    case 'RATE_LIMIT':
-      return 'rate';
-    default:
-      return undefined;
-  }
-}
-
-function json(value, status = 200) {
-  return Response.json(value, { status, headers: { 'cache-control': 'no-store' } });
-}
-
-export function apply(ctx) {
+export function registerNotifications(ctx, { readSettings, updateSettings, showToast, appendLog }) {
   appendLog('plugin applied');
-  // The shared owner route has no workspace-scoped principal. Expose only
-  // bounded routing metadata, never assistant or provider error text.
-  let eventCursor = 0;
+  const delivery = createDelivery(showToast, appendLog);
   const epoch = randomUUID();
-  const eventBuffer = [];
-  const immediateAlerts = new Map();
-  const turnKey = (sessionId, turn) => JSON.stringify([sessionId, turn]);
+  const feed = [];
+  // The waterfall owns the decision. Keep only its lifetime and routing identity.
+  const pendingRequests = new Map();
+  let requestGeneration = 0;
+  function pendingRef(kind, sessionId, callId) {
+    return JSON.stringify([kind === 'approval' ? 'approval' : 'question', sessionId, callId]);
+  }
 
-  ctx.effect(() => {
-    const registrations = [];
-    registrations.push(ctx.connection.fetch.register({
-      path: '/api/dsh-xin505-notify/events', methods: ['GET'], requestBody: 'buffered',
-      fetch: async (request) => {
-        const raw = new URL(request.url).searchParams.get('after');
-        if (raw === null) return json({ ok: true, epoch, cursor: eventCursor, events: [] });
-        if (!/^(0|[1-9]\d*)$/.test(raw) || !Number.isSafeInteger(Number(raw))) return json({ ok: false }, 400);
-        const after = Number(raw);
-        const cursor = eventCursor;
-        const snapshot = eventBuffer.filter(event => event.id > after && event.id <= cursor);
-        const events = await Promise.all(snapshot.map(async ({ alert, ...event }) => ({
-          ...event, ...(alert ? { hostAnnounced: await alert } : {}),
-        })));
-        return json({ ok: true, epoch, cursor, events });
-      },
-    }));
-    registrations.push(ctx.connection.fetch.register({
-      path: '/api/dsh-xin505-notify/settings', methods: ['GET'], requestBody: 'buffered',
-      fetch: async () => {
-        try { return json({ ok: true, enabled: readEnabled() }); }
-        catch { return json({ ok: false, exit: 'settings-error' }, 503); }
-      },
-    }));
-    registrations.push(ctx.connection.fetch.register({
-      path: '/api/dsh-xin505-notify/settings/update', methods: ['POST'], requestBody: 'streaming',
-      fetch: async (request) => {
-        const body = await readBody(request);
-        if (body.status) return json({ ok: false, exit: 'invalid-request' }, body.status);
-        if (!body.value || Array.isArray(body.value) || typeof body.value.enabled !== 'boolean') return json({ ok: false, exit: 'invalid-request' }, 400);
-        try { saveEnabled(body.value.enabled); return json({ ok: true, enabled: readEnabled() }); }
-        catch { return json({ ok: false, exit: 'settings-error' }, 503); }
-      },
-    }));
-    registrations.push(ctx.connection.fetch.register({
-      path: '/api/dsh-xin505-notify/toast', methods: ['POST'], requestBody: 'streaming',
-      fetch: async (request) => {
-        const body = await readBody(request);
-        if (body.status) return json({ ok: false, exit: 'invalid-request' }, body.status);
-        if (!body.value || Array.isArray(body.value) || typeof body.value !== 'object') return json({ ok: false, exit: 'invalid-request' }, 400);
-        const result = await showToast({ title: body.value.title, body: body.value.body, silent: body.value.silent === true, source: 'client' });
-        return json(result);
-      },
-    }));
-    return () => { for (const dispose of registrations) void dispose(); };
-  }, 'dsh-xin505-notify: routes');
-
-  // ---- account and quota announcements -------------------------------
-
-  ctx.effect(() => {
-    const recent = new Map();
-    const throttled = (key, windowMs) => {
-      const now = Date.now();
-      for (const [id, at] of recent) if (now - at > windowMs) recent.delete(id);
-      const last = recent.get(key);
-      if (last !== undefined && now - last < windowMs) return true;
-      recent.set(key, now);
-      return false;
-    };
-
-    const announce = (kind, body, key, windowMs) => {
-      try { if (!readEnabled()) return Promise.resolve(false); } catch { return Promise.resolve(false); }
-      if (throttled(key, windowMs)) return Promise.resolve(false);
-      return showToast({ title: titleOf(kind), body, source: 'host:' + kind }).then(result => result.ok);
-    };
-
-    const offSessionEvent = ctx.on('session/event', (session, event) => {
-      if (event?.type !== 'turn/end' || !session || typeof session.id !== 'string') return;
-      try { if (!readEnabled()) return; } catch { return; }
-      if (session.header?.origin === 'subagent' || session.header?.delegationDepth > 0) return;
-      const { turn, reason } = event.data ?? {};
-      if (!Number.isSafeInteger(turn) || turn < 0 || !['completed', 'error', 'aborted', 'blocked', 'max-tokens'].includes(reason?.kind)) return;
-      const code = reason.kind === 'error' && typeof reason.error?.code === 'string' && /^[A-Z0-9_]{1,64}$/.test(reason.error.code)
-        ? reason.error.code : undefined;
-      const key = turnKey(session.id, turn);
-      const alert = immediateAlerts.get(key);
-      immediateAlerts.delete(key);
-      eventBuffer.push({ id: ++eventCursor, sessionId: session.id, turn, kind: reason.kind,
-        ...(code ? { code } : {}), ...(alert ? { alert } : {}) });
-      if (eventBuffer.length > 128) eventBuffer.shift();
-    });
-
-    // One failed model request: quota, credential and rate-limit codes are the
-    // ones the user must act on; every other failure is already visible in chat.
-    const offRequestError = ctx.on('agent/request-error', function (payload, next) {
-      try {
-        const failure = payload?.failure;
-        const kind = failureKind(failure?.code);
-        if (kind !== undefined) {
-          const fallback = kind === 'quota'
-            ? '这一轮因为额度或余额不足停下了，充值后可以继续。'
-            : kind === 'auth'
-              ? '请检查模型服务的登录状态或凭证。'
-              : kind === 'config'
-                ? '未找到可用的模型服务，请检查模型配置。'
-                : '请求过于频繁，请查看会话中的重试状态。';
-          const sessionId = String(payload?.agent?.session?.id ?? payload?.agent?.id ?? 'session');
-          const alert = announce(kind, fallback, kind + ':' + sessionId, 60_000);
-          if (Number.isSafeInteger(payload?.turn)) {
-            const key = turnKey(sessionId, payload.turn);
-            const previous = immediateAlerts.get(key);
-            immediateAlerts.set(key, previous ? Promise.all([previous, alert]).then(values => values.some(Boolean)) : alert);
-            if (immediateAlerts.size > 128) immediateAlerts.delete(immediateAlerts.keys().next().value);
-          }
+  function observePending(kind) {
+    return async (request, next) => {
+      const sessionId = request?.agent?.session?.id;
+      if (typeof sessionId !== 'string') return next();
+      const callId = (kind === 'approval' ? request.callId : request.wait?.callId) ?? null;
+      const key = pendingRef(kind, sessionId, callId);
+      let record = pendingRequests.get(key);
+      if (!record || !record.active) {
+        if (record) pendingRequests.delete(key);
+        if (pendingRequests.size >= 2048) {
+          // Eviction makes an identity unknown. An unobserved request remains eligible.
+          pendingRequests.delete(pendingRequests.keys().next().value);
         }
-      } catch (error) {
-        appendLog('request-error listener failed');
+        record = { active: 0, generation: ++requestGeneration };
+        pendingRequests.set(key, record);
       }
-      return next();
-    });
-
-    const offSignIn = ctx.on('deepseek-account/model-sign-in-required', () => {
-      announce('auth', '有一条请求需要你登录 DeepSeek Harness 账号。', 'sign-in-required', 300_000);
-    });
-
-    const offExpired = ctx.on('deepseek-account/session-expired', () => {
-      announce('expired', '登录已过期，请重新登录 DeepSeek Harness 账号。', 'session-expired', 300_000);
-    });
-
-    return () => {
-      offSessionEvent();
-      offRequestError();
-      offSignIn();
-      offExpired();
+      record.active++;
+      let finished = false;
+      const finish = () => {
+        if (!finished) { finished = true; record.active--; }
+      };
+      const signal = request.signal;
+      signal?.addEventListener('abort', finish, { once: true });
+      if (signal?.aborted) finish();
+      try { return await next(); }
+      finally { finish(); signal?.removeEventListener('abort', finish); }
     };
-  }, 'dsh-xin505-notify: account events');
+  }
+  let cursor = 0;
+  let expiration = 0;
+
+  function enabled() {
+    try { return readSettings().enabled; } catch { return false; }
+  }
+
+  function getEvents(request) {
+    const raw = new URL(request.url).searchParams.get('after');
+    if (raw === null) return json({ ok: true, epoch, cursor, events: [] });
+    if (!/^(0|[1-9]\d*)$/.test(raw) || !Number.isSafeInteger(Number(raw))) return invalid();
+    return json({ ok: true, epoch, cursor, events: feed.filter(e => e.id > Number(raw)) });
+  }
+
+  function changeSettings(patch) {
+    const keys = Object.keys(patch);
+    if (!keys.length || keys.some(key => !['enabled', 'preview'].includes(key) || typeof patch[key] !== 'boolean')) return invalid();
+    const settings = updateSettings(patch);
+    if (!settings.enabled) { delivery.clear(); feed.length = 0; }
+    else if (!settings.preview) delivery.clearPreviews();
+    return json({ ok: true, ...settings });
+  }
+
+  async function handleToast(input) {
+    if (!['test', 'ready', 'pending', 'turn'].includes(input.type)) return invalid();
+    const settings = readSettings();
+    if (!settings.enabled) return json({ ok: false, exit: 'disabled' });
+    const locale = ['zh', 'en'].includes(input.locale) ? input.locale : defaultLocale();
+    const silent = input.silent === true;
+    const detail = settings.preview && typeof input.body === 'string' ? [...input.body].slice(0, 180).join('') : '';
+    if (input.type === 'turn') {
+      if (!Number.isSafeInteger(input.id) || typeof input.epoch !== 'string') return invalid();
+      const event = input.epoch === epoch && feed.find(e => e.id === input.id);
+      if (!event) return json({ ok: false, exit: 'stale' });
+      const kind = terminalKind(event);
+      if (kind) delivery.enrich(turnKey(event.sessionId, event.turn, kind), makeMessage(kind, locale, silent, kind === 'completed' ? detail : ''));
+      // Final delivery belongs to the Host even when this response is lost.
+      return json({ ok: true });
+    }
+    if (input.type === 'pending') {
+      if (!PENDING_KINDS.has(input.kind) || typeof input.key !== 'string' || !input.key.length || Buffer.byteLength(input.key) > 512) return invalid();
+      let record;
+      if (input.ref !== undefined) {
+        const ref = input.ref;
+        if (!Array.isArray(ref) || ref.length !== 2 || typeof ref[0] !== 'string' ||
+            (ref[1] !== null && typeof ref[1] !== 'string')) return invalid();
+        record = pendingRequests.get(pendingRef(input.kind, ref[0], ref[1]));
+        if (record && !record.active) return json({ ok: false, exit: 'stale' });
+      }
+      const key = JSON.stringify(['pending', input.kind, input.key, record?.generation ?? 0]);
+      return json(await delivery.once(key, makeMessage(input.kind, locale, silent, detail)));
+    }
+    const message = makeMessage(input.type, locale, silent);
+    return json(await (input.type === 'ready' ? delivery.once('ready', message) : showToast(message)));
+  }
+
+  function onTurn(session, event) {
+    if (event?.type !== 'turn/end' || !mainSession(session) || !enabled()) return;
+    const { turn, reason } = event.data ?? {};
+    if (!Number.isSafeInteger(turn) || turn < 0 || !END_KINDS.has(reason?.kind)) return;
+    // Owner pages only receive routing metadata. Free-form hook reasons and
+    // provider messages stay on their original, session-scoped paths.
+    const row = { id: ++cursor, sessionId: session.id, turn, kind: reason.kind };
+    if (reason.kind === 'error' && typeof reason.error?.code === 'string' && /^[A-Z0-9_]{1,64}$/.test(reason.error.code)) row.code = reason.error.code;
+    if (reason.kind === 'aborted' && CANCEL_CAUSES.has(reason.reason?.kind)) row.cause = reason.reason.kind;
+    feed.push(row);
+    if (feed.length > 128) feed.shift();
+    const kind = terminalKind(row);
+    if (kind) delivery.schedule(turnKey(session.id, turn, kind), makeMessage(kind, defaultLocale()), TURN_GRACE_MS);
+  }
+
+  function onRequest(payload, next) {
+    try {
+      const kind = failureKind(payload?.failure?.code);
+      const session = payload?.agent?.session;
+      if (kind && mainSession(session) && Number.isSafeInteger(payload.turn) && payload.turn >= 0 && enabled()) {
+        delivery.schedule(turnKey(session.id, payload.turn, kind), makeMessage(kind, defaultLocale()));
+      }
+    } catch { appendLog('request-error listener failed'); }
+    return next();
+  }
+
+  ctx.effect(() => {
+    const handlers = [];
+    function route(path, method, handler) {
+      handlers.push(ctx.connection.fetch.register({
+        path: BASE + path, methods: [method], requestBody: method === 'POST' ? 'streaming' : 'buffered',
+        fetch: async request => {
+          try {
+            if (method === 'GET') return await handler(request);
+            const body = await readBody(request);
+            if (body.status) return json({ ok: false, exit: 'invalid-request' }, body.status);
+            if (!isRecord(body.value)) return invalid();
+            return await handler(body.value);
+          } catch { return json({ ok: false, exit: 'host-error' }, 503); }
+        },
+      }));
+    }
+    route('events', 'GET', getEvents);
+    route('settings', 'GET', () => json({ ok: true, ...readSettings() }));
+    route('settings/update', 'POST', changeSettings);
+    route('toast', 'POST', handleToast);
+    handlers.push(ctx.on('session/event', onTurn), ctx.on('agent/request-error', onRequest));
+    handlers.push(ctx.on('approval/request', observePending('approval'), { prepend: true }));
+    handlers.push(ctx.on('user-questions/request', observePending('question'), { prepend: true }));
+    // rc.3 emits model-sign-in-required from the same ACCOUNT_SIGN_IN_REQUIRED
+    // agent/error. The request/turn listeners already own that notification.
+    handlers.push(ctx.on('deepseek-account/session-expired', () => {
+      if (enabled()) delivery.schedule('expired:' + ++expiration, makeMessage('expired', defaultLocale()));
+    }));
+    return () => {
+      delivery.dispose();
+      pendingRequests.clear();
+      for (const off of handlers) void off();
+    };
+  }, 'dsh-xin505-notify: notifications');
 }

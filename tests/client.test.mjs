@@ -1,192 +1,222 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { webcrypto } from 'node:crypto';
 import vm from 'node:vm';
 
 const source = await readFile(new URL('../client.js', import.meta.url), 'utf8');
+const tick = () => new Promise(resolve => setTimeout(resolve, 0));
+const completion = { id: 1, sessionId: 's1', turn: 7, kind: 'completed' };
+const approval = { key: 'approval:3', callId: 'call-7', kind: 'approval', reason: 'private approval' };
 
-async function startClient(enabled, focused = false, config = {}) {
-  const handlers = new Map();
+async function startClient(options = {}) {
+  const settings = { enabled: true, preview: false, ...options.settings };
   const requests = [];
-  let snapshot = new Map();
-  let eventRows = [];
-  let epoch = 'first';
-  const toastResults = [];
-  const timers = [];
-  let poll;
-  const statusListeners = new Set();
-  let module;
+  const cleanups = [], timeouts = new Map(), subscriptions = new Set(), listeners = new Map();
+  const toastResults = [], visible = { value: options.focused === true };
+  const readGates = options.readGates ?? [];
+  let state = new Map(), rows = [], epoch = 'first', interval, module, component, ticks = 0, privateReads = 0;
+  const react = {
+    createElement: (tag, props, ...children) => ({ tag, props, children }),
+    useState: value => [typeof value === 'function' ? value() : value, () => {}],
+    useEffect() {},
+    useSyncExternalStore(_sub, read) { return read(); },
+  };
   const window = {
-    __ModuleLoader__: { load(value) { module = value.factory(() => ({ createElement() {} })); } },
-    localStorage: { getItem(key) { return key.endsWith(':verified') ? '1' : null; }, setItem() {} },
-    setTimeout(fn) { timers.push(fn); return timers.length; }, clearTimeout() {},
-    setInterval(fn) { poll = fn; return 1; }, clearInterval() {},
-    addEventListener() {}, removeEventListener() {},
-    async fetch(url, options = {}) {
-      requests.push({ url, options });
-      return { ok: true, status: 200, async json() {
-        if (url.includes('/settings')) { if (config.settingsGate) await config.settingsGate; return { ok: true, enabled }; }
-        if (url.includes('/events')) {
-          const after = /[?&]after=(\d+)/.exec(url);
-          return { ok: true, epoch, cursor: eventRows.length, events: after ? eventRows.filter(row => row.id > Number(after[1])) : [] };
-        }
-        return toastResults.shift() ?? { ok: true };
-      } };
+    crypto: options.noSubtleCrypto ? {} : webcrypto,
+    __ModuleLoader__: { load(spec) { module = spec.factory(() => react); } },
+    localStorage: { getItem() { return options.readyTest ? null : '1'; }, setItem() {} },
+    setTimeout(fn, ms) { timeouts.set(++ticks, { fn, ms }); return ticks; },
+    clearTimeout(key) { timeouts.delete(key); },
+    setInterval(fn) { interval = fn; return 1; }, clearInterval() { interval = null; },
+    addEventListener(name, fn) { const set = listeners.get(name) ?? new Set(); set.add(fn); listeners.set(name, set); },
+    removeEventListener(name, fn) { listeners.get(name)?.delete(fn); },
+    async fetch(url, init = {}) {
+      requests.push({ url, init });
+      if (url.includes('/settings')) {
+        if (init.method === 'POST') Object.assign(settings, JSON.parse(init.body));
+        const copy = { ...settings };
+        const promise = !init.method || init.method === 'GET' ? readGates.shift() : undefined;
+        if (promise) await promise;
+        return Response.json({ ok: true, ...copy });
+      }
+      if (url.includes('/events')) {
+        const after = new URL(url,'http://test').searchParams.get('after');
+        return Response.json({ ok: true, epoch, cursor: rows.length, events: after === null ? [] : rows.filter(row => row.id > Number(after)) });
+      }
+      const next = await toastResults.shift();
+      if (next instanceof Error) throw next;
+      return Response.json(next ?? { ok: true });
     },
   };
-  vm.runInNewContext(source, { window, document: { visibilityState: focused ? 'visible' : 'hidden', hasFocus: () => focused }, console });
+  vm.runInNewContext(source, { window, document: { visibilityState: visible.value ? 'visible' : 'hidden', hasFocus: () => visible.value }, console, TextEncoder, AbortController });
   const ctx = {
-    effect(fn) { fn(); },
-    locale: { register() {}, bind() { return key => key; } },
-    slots: { inject() {}, register() {} },
-    remote: { $on(event, listener) { handlers.set(event, listener); return () => {}; } },
+    effect(fn) { const off = fn(); if (typeof off === 'function') cleanups.push(off); },
+    locale: { register() {}, bind: () => key => key },
+    slots: { inject(_name, fn) { fn(); }, register(_spec, comp) { component = comp; } },
+    remote: {},
     uiSession: { sessionStatus: {
-      getSnapshot() { return snapshot; },
-      subscribe(listener) { statusListeners.add(listener); return () => statusListeners.delete(listener); },
+      getSnapshot() { return state; },
+      subscribe(fn) { subscriptions.add(fn); return () => subscriptions.delete(fn); },
     } },
-    get(name) { return name === 'sessions' ? { binding(id) {
-      if (id !== 's1') return undefined;
-      return { eventSource: { getSnapshot: () => ({ entries: config.entries ?? [{ type: 'event', event: {
-        type: 'assistant/message', data: { turn: 7, message: { content: [{ type: 'text', text: '任务已经做好' }] } },
-      } }] }) } };
-    } } : undefined; },
+    get(name) {
+      if (name !== 'sessions') return;
+      privateReads++;
+      return { binding: () => ({ eventSource: { getSnapshot: () => ({ entries: options.entries ?? [{ event: {
+        type: 'assistant/message', data: { turn: 7, message: { content: [{ type: 'text', text: 'private final reply' }] } },
+      } }] }) } }) };
+    },
   };
   module.apply(ctx);
-  await new Promise(resolve => setTimeout(resolve, 0));
-  return { handlers, requests, pushEvents(rows) { eventRows = rows; }, restart(rows) { epoch = 'second'; eventRows = rows; }, toastResults, async fireTimer() { const fn = timers.shift(); if (fn) fn(); await new Promise(resolve => setTimeout(resolve, 0)); }, async poll() { if (poll) await poll(); await new Promise(resolve => setTimeout(resolve, 0)); }, update(entries) {
-    snapshot = new Map(entries);
-    for (const listener of statusListeners) listener();
-  } };
+  await tick();
+  return {
+    settings, requests, toastResults, timeouts, get privateReads() { return privateReads; },
+    toasts() { return requests.filter(r => r.url.endsWith('/toast')).map(r => JSON.parse(r.init.body)); },
+    rows(value, newEpoch = epoch) { rows = value; epoch = newEpoch; },
+    async poll() { await interval?.(); await tick(); },
+    async update(...entries) { state = new Map(entries.map(([id, req]) => [id, { pendingInteraction: req }])); for (const fn of subscriptions) fn(); await tick(); },
+    async trigger(name) { for (const fn of listeners.get(name) ?? []) fn(); await tick(); },
+    unmount() { for (const fn of cleanups.reverse()) fn(); },
+    async fireTimer() { const first = timeouts.entries().next().value; if (first) { timeouts.delete(first[0]); first[1].fn(); } await tick(); },
+    switches() {
+      const found = [];
+      function visit(entry) { if (entry?.props?.role === 'switch') found.push(entry.props); for (const child of entry?.children ?? []) visit(child); }
+      visit(component({ t: key => key })); return found;
+    },
+  };
 }
 
-test('a disabled host preference prevents pending interaction notifications', async () => {
-  const { update, requests } = await startClient(false);
-  update([['s1', { pendingInteraction: { kind: 'approval', key: 'a1', reason: 'approve?' } }]]);
-  await new Promise(resolve => setTimeout(resolve, 0));
-  assert.ok(requests.some(({ url }) => url.includes('/settings')));
-  assert.equal(requests.filter(({ url }) => url.includes('/toast')).length, 0);
+test('default and legacy preferences send status only, without reading message histories', async () => {
+  const c = await startClient({ settings: { preview: undefined } });
+  c.rows([completion]); await c.poll();
+  await c.update(['s1', approval]);
+  assert.deepEqual(c.toasts().map(n => [n.type, n.body]), [['turn', undefined], ['pending', undefined]]);
+  assert.equal(c.privateReads, 0);
+  assert.equal(JSON.stringify(c.toasts()).includes('private'), false);
 });
-
-test('host restart fetches events in the new epoch rather than skipping early turns', async () => {
-  const { requests, pushEvents, restart, poll } = await startClient(true);
-  pushEvents([{ id: 1, sessionId: 's1', turn: 7, kind: 'completed' }]);
-  await poll();
-  restart([{ id: 1, sessionId: 's2', turn: 8, kind: 'completed' }]);
-  await poll();
-  const eventUrls = requests.filter(x => x.url.includes('/events')).map(x => x.url);
-  assert.ok(eventUrls.at(-1).endsWith('?after=0'));
-  assert.equal(requests.filter(x => x.url.includes('/toast')).length, 2);
+test('disabled preferences stop all UI requests for notifications', async () => {
+  const c = await startClient({ settings: { enabled: false, preview: true } });
+  c.rows([completion]); await c.poll(); await c.update(['s1', approval]);
+  assert.equal(c.toasts().length, 0);
 });
-
-test('events wait for the initial host preference instead of being discarded', async () => {
-  let ready;
-  const settingsGate = new Promise(resolve => { ready = resolve; });
-  const { requests, pushEvents, poll } = await startClient(true, false, { settingsGate });
-  pushEvents([{ id: 1, sessionId: 's1', turn: 7, kind: 'completed' }]);
-  await poll();
-  assert.equal(requests.filter(x => x.url.includes('/toast')).length, 0);
-  ready();
-  await new Promise(resolve => setTimeout(resolve, 0));
-  await poll();
-  assert.equal(requests.filter(x => x.url.includes('/toast')).length, 1);
-});
-
-test('busy pending notification retries and is marked seen only after successful delivery', async () => {
-  const { requests, toastResults, update, fireTimer } = await startClient(true);
-  toastResults.push({ ok: false, exit: 'rate-limited' }, { ok: true });
-  const approval = { kind: 'approval', key: 'retry', reason: 'approve?' };
-  update([['s1', { pendingInteraction: approval }]]);
-  await new Promise(resolve => setTimeout(resolve, 0));
-  update([['s1', { pendingInteraction: approval }]]);
-  assert.equal(requests.filter(x => x.url.includes('/toast')).length, 1);
-  await fireTimer();
-  assert.equal(requests.filter(x => x.url.includes('/toast')).length, 2);
-  update([['s1', { pendingInteraction: approval }]]);
-  await new Promise(resolve => setTimeout(resolve, 0));
-  assert.equal(requests.filter(x => x.url.includes('/toast')).length, 2);
-});
-
-test('a busy pending notification retries at most twice', async () => {
-  const { requests, toastResults, update, fireTimer } = await startClient(true);
-  toastResults.push(...Array(3).fill({ ok: false, exit: 'rate-limited' }));
-  const pending = [['s1', { pendingInteraction: { kind: 'approval', key: 'busy', reason: 'Allow?' } }]];
-  update(pending);
-  await new Promise(resolve => setTimeout(resolve, 0));
-  await fireTimer();
-  await fireTimer();
-  update(pending);
-  await new Promise(resolve => setTimeout(resolve, 0));
-  assert.equal(requests.filter(x => x.url.includes('/toast')).length, 3);
-});
-
-test('completed turn notifications are sent serially', async () => {
-  const { requests, toastResults, pushEvents, poll } = await startClient(true);
-  let finish;
-  toastResults.push(new Promise(resolve => { finish = resolve; }), { ok: true });
-  pushEvents([{ id: 1, sessionId: 's1', turn: 7, kind: 'completed' }, { id: 2, sessionId: 's2', turn: 3, kind: 'completed' }]);
-  const running = poll();
-  await new Promise(resolve => setTimeout(resolve, 0));
-  assert.equal(requests.filter(x => x.url.includes('/toast')).length, 1);
-  finish({ ok: true });
-  await running;
-  assert.equal(requests.filter(x => x.url.includes('/toast')).length, 2);
-});
-
-test('settled turns notify with reply preview, while aborted and host-announced errors do not duplicate', async () => {
-  const { requests, pushEvents, poll } = await startClient(true);
-  pushEvents([
-    { id: 1, sessionId: 's1', turn: 7, kind: 'completed' },
-    { id: 2, sessionId: 's2', kind: 'aborted' },
-    { id: 3, sessionId: 's3', kind: 'error', hostAnnounced: true },
-    { id: 4, sessionId: 's4', kind: 'error' },
+test('foreground, final outcomes and host epoch travel as typed hints, including recovery after a warning', async () => {
+  const c = await startClient({ focused: true, settings: { preview: true } });
+  c.rows([{ ...completion, hostAnnounced: true }]); await c.poll();
+  c.rows([{ ...completion, kind: 'error', code: 'NO_ADAPTER' }], 'second'); await c.poll();
+  assert.deepEqual(c.toasts(), [
+    { type: 'turn', epoch: 'first', id: 1, locale: 'en', silent: true, body: 'private final reply' },
+    { type: 'turn', epoch: 'second', id: 1, locale: 'en', silent: true },
   ]);
-  await poll();
-  const toasts = requests.filter(({ url }) => url.includes('/toast')).map(({ options }) => JSON.parse(options.body));
-  assert.deepEqual(toasts.map(x => x.body), ['任务已经做好', 'notify.failedBody']);
+});
+test('a tool-only final message does not preview an earlier assistant step', async () => {
+  const entry = content => ({ event: { type: 'assistant/message', data: { turn: 7, message: { content } } } });
+  const c = await startClient({ settings: { preview: true }, entries: [entry([{ type: 'text', text: 'working' }]), entry([{ type: 'tool-call' }])] });
+  c.rows([completion]); await c.poll();
+  assert.equal(c.toasts()[0].body, undefined);
+});
+test('delayed initial settings preserve recent events', async () => {
+  let release;
+  const c = await startClient({ readGates: [new Promise(r => { release = r; })] });
+  c.rows([completion]); await c.poll();
+  assert.equal(c.toasts().length, 0);
+  release(); await tick(); await c.poll();
+  assert.equal(c.toasts().length, 1);
+});
+test('review cards, settled questions, and questions continued by the agent stay quiet', async () => {
+  const c = await startClient();
+  const q = { key: 'question:2', kind: 'question', callId: 'q2', questions: [{ question: 'which?' }] };
+  await c.update(['s1', { ...q, review: [] }]);
+  await c.update(['s1', { ...q, kind: 'plan-review', getSnapshot: () => ({ state: 'continued' }) }]);
+  await c.update(['s1', { ...q, getSnapshot: () => ({ closed: true }) }]);
+  assert.equal(c.toasts().length, 0);
+});
+test('an outstanding approval recovers from network, timeout, and throttling with a stable identity', async () => {
+  const c = await startClient({ settings: { preview: true } });
+  c.toastResults.push(new Error('offline'), { ok: false, exit: 'timeout' }, { ok: false, exit: 'rate-limited' }, { ok: true });
+  await c.update(['s1', approval]);
+  for (let i = 0; i < 3; i++) await c.fireTimer();
+  await c.update(['s1', approval]);
+  assert.equal(c.toasts().length, 4);
+  assert.equal(new Set(c.toasts().map(n => n.key)).size, 1);
+  assert.ok(c.toasts().every(n => n.type === 'pending' && n.body === approval.reason));
+});
+test('recovery stops when the pending action has been answered', async () => {
+  const c = await startClient();
+  c.toastResults.push(new Error('offline'));
+  await c.update(['s1', approval]); await c.update(); await c.fireTimer();
+  assert.equal(c.toasts().length, 1);
 });
 
-test('a completed turn still displays a silent notification when DSH has focus', async () => {
-  const { requests, pushEvents, poll } = await startClient(true, true);
-  pushEvents([{ id: 1, sessionId: 's1', turn: 7, kind: 'completed' }]);
-  await poll();
-  const toast = requests.filter(({ url }) => url.includes('/toast')).map(({ options }) => JSON.parse(options.body));
-  assert.equal(toast.length, 1);
-  assert.equal(toast[0].silent, true);
+test('a pending offer carries Host correlation and a settled reply is terminal', async () => {
+  const c = await startClient();
+  c.toastResults.push({ ok: false, exit: 'stale' });
+  await c.update(['s1', approval]);
+  await c.fireTimer();
+  assert.equal(c.toasts().length, 1);
+  assert.deepEqual(c.toasts()[0].ref, ['s1', approval.callId]);
 });
 
-test('a tool-only final assistant message never previews an earlier step as the final reply', async () => {
-  const entries = [
-    { type: 'event', event: { type: 'assistant/message', data: { turn: 7, message: { content: [{ type: 'text', text: '正在处理' }] } } } },
-    { type: 'event', event: { type: 'assistant/message', data: { turn: 7, message: { content: [{ type: 'tool-call', name: 'check' }] } } } },
-  ];
-  const { requests, pushEvents, poll } = await startClient(true, false, { entries });
-  pushEvents([{ id: 1, sessionId: 's1', turn: 7, kind: 'completed' }]);
-  await poll();
-  const toast = requests.filter(({ url }) => url.includes('/toast')).map(({ options }) => JSON.parse(options.body));
-  assert.equal(toast[0].body, 'notify.doneBody');
+test('a withdrawn approval still present in the view cannot trigger a toast', async () => {
+  const c = await startClient();
+  await c.update(['s1', { ...approval, answerable: false }]);
+  assert.equal(c.toasts().length, 0);
 });
 
-test('missing adapter asks to check model configuration, not sign in', async () => {
-  const { requests, pushEvents, poll } = await startClient(true);
-  pushEvents([{ id: 1, sessionId: 's2', turn: 3, kind: 'error', code: 'NO_ADAPTER' }]);
-  await poll();
-  const toast = requests.filter(({ url }) => url.includes('/toast')).map(({ options }) => JSON.parse(options.body));
-  assert.equal(toast[0].title, 'DeepSeek Harness · notify.configTitle');
+test('a long outage pauses retries and reconnect resumes an outstanding approval', async () => {
+  const c = await startClient();
+  c.toastResults.push(...Array.from({ length: 6 }, () => new Error('offline')));
+  await c.update(['s1', approval]);
+  for (let i = 0; i < 7; i++) await c.fireTimer();
+  assert.equal(c.toasts().length, 6);
+  await c.trigger('online');
+  assert.equal(c.toasts().length, 7);
+  assert.equal(new Set(c.toasts().map(payload => payload.key)).size, 1);
+});
+test('related windows send the same pending key even when local approval numbers differ', async () => {
+  const [one,two] = await Promise.all([startClient(),startClient()]);
+  await one.update(['s1',approval]);
+  await two.update(['s1',{ ...approval, key:'approval:94' }]);
+  assert.ok(one.toasts()[0].key);
+  assert.equal(one.toasts()[0].key, two.toasts()[0].key);
 });
 
-test('new pending approvals and questions produce one notification each without waterfall ordering', async () => {
-  const { update, requests, handlers } = await startClient(true);
-  const approval = { kind: 'approval', key: 'a1', reason: 'approve?' };
-  const question = { kind: 'question', key: 'q1', questions: [{ question: 'Which?' }] };
-  update([['s1', { pendingInteraction: approval }]]);
-  update([['s1', { pendingInteraction: approval }], ['s2', { pendingInteraction: question }]]);
-  update([['s1', { pendingInteraction: approval }]]);
-  update([['s1', { pendingInteraction: approval }], ['s2', { pendingInteraction: question }]]);
-  await new Promise(resolve => setTimeout(resolve, 0));
-  const toasts = requests.filter(({ url }) => url.includes('/toast')).map(({ options }) => JSON.parse(options.body));
-  assert.equal(toasts.length, 2);
-  assert.equal(toasts[0].body, 'approve?');
-  assert.equal(toasts[1].body, 'Which?');
-  assert.equal(handlers.has('approval/request'), false);
-  assert.equal(handlers.has('user-questions/request'), false);
+test('oversized shared tool IDs deduplicate across desktop and non-secure Web clients', async () => {
+  const [desktop, web] = await Promise.all([startClient(), startClient({ noSubtleCrypto: true })]);
+  const request = { ...approval, callId: 'tool-call-'.repeat(100) };
+  await desktop.update(['s1', request]);
+  await web.update(['s1', { ...request, key: 'approval:other-window' }]);
+  const key = desktop.toasts()[0].key;
+  assert.ok(Buffer.byteLength(key) < 512);
+  assert.equal(web.toasts()[0].key, key);
+});
+test('arbitrary length localized approval and question text fits the JSON request limit', async () => {
+  const c = await startClient({ settings: { preview: true } });
+  const long = '文💬"\\'.repeat(1800);
+  await c.update(['s1', { ...approval, displayReason: { en: long } }]);
+  await c.update(['s2', { kind:'question', key:'q1', questions:[{ header:long, question:long }] }]);
+  assert.equal(c.toasts().length, 2);
+  for (const n of c.toasts()) { assert.ok(n.body); assert.ok(Buffer.byteLength(JSON.stringify(n)) <= 4096); }
+});
+test('switching off previews in another window prevents reading or posting private details', async () => {
+  const c = await startClient({ settings: { preview: true } });
+  c.settings.preview = false;
+  c.rows([completion]); await c.poll();
+  await c.update(['s1', approval]);
+  assert.equal(c.privateReads, 0);
+  assert.ok(c.toasts().every(n => !('body' in n)));
+});
+test('preview switch persists a partial preference update without changing the master switch', async () => {
+  const c = await startClient();
+  const switches = c.switches();
+  assert.equal(switches.length, 2);
+  await switches.find(s => s['aria-checked'] === false).onClick();
+  const writes = c.requests.filter(r => r.url.endsWith('/update')).map(r => JSON.parse(r.init.body));
+  assert.deepEqual(writes,[{ preview:true }]);
+  assert.equal(c.settings.enabled,true);
+});
+test('self-test timers are cancelled on unload', async () => {
+  const c = await startClient({ readyTest:true });
+  assert.ok(c.timeouts.size);
+  c.unmount(); await c.fireTimer();
+  assert.deepEqual(c.toasts(), []);
 });

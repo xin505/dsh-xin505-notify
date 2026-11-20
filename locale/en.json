@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Desktop notifications",
-    "description": "Pops up a Windows notification, shown as DeepSeek Harness, when a reply finishes, an approval is pending, the agent asks you a question, or the account runs out of quota or its sign-in expires. Switch it off or send a test popup in Settings > General."
+    "description": "Shows Windows notifications for completed or failed tasks, pending approvals or questions, and recognized quota or sign-in problems. Notifications show status only by default. Enable content previews in Settings › General › Desktop notifications."
   }
 }
