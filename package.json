@@ -1,6 +1,6 @@
 {
   "name": "dsh-xin505-notify",
-  "version": "0.1.0-alpha.2",
+  "version": "0.1.0-alpha.3",
   "description": "DeepSeek Harness 的 Windows 桌面通知。你不可能一直盯着 Agent。它卡在权限审批、额度不足或其他问题上，你可能一时没发现。这时候，你就需要这个插件了。",
   "type": "module",
   "license": "MIT",
@@ -14,7 +14,7 @@
   },
   "engines": {
     "node": ">=22",
-    "dsh": "0.2.2-rc.3"
+    "dsh": ">=0.2.2-rc.3 <0.2.3-0"
   },
   "scripts": {
     "test": "node --test tests/*.test.mjs"
